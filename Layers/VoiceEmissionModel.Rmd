@@ -1,0 +1,324 @@
+---
+title: "Modèle d'activité voix"
+author: "Jonathan Siliézar"
+date: "01/07/2021"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: false
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+Dans le cadre de mon stage intitulé "Modélisation numérique des paysages sonores urbains" à l'UMRAE - Université Gustave Eiffel, une chaîne de modélisation est proposée considérant 2 sources d'intérêt : La voix humaine et le trafic routier. Cette modélisation se base sur un modèle d'activité et un modèle d'émission couplés à un modèle de propagation implementé sur NoiseModelling. L'objectif de ce document est de présenter les differentes étapes à suivre pour la géneration des cartes de bruit dynamiques (en temps) à partir des données spatiales d'une zone d'étude (Centre ville du Nantes). On s'intéresse ici donc à la constitution d'un modèle d'activité pour la voix humaine.
+
+# Set working directory and libraries
+On commence par definir le repertoire où on va trouver nos fichiers ainsi que les libraries à utiliser
+
+```{r, message=FALSE, warning=FALSE}
+setwd("C:/Uriel/Stage Inge/Rapport Stage/MarkDown/Layers")
+library(geojsonR)
+library(ggplot2)
+library(sf)
+library(leaflet)
+library(raster)
+library(rgdal)
+library(stars)
+library(dplyr)
+library(sp)
+library(raster)
+library(lwgeom)
+library(units)
+library(data.table)
+
+```
+
+# Obtention des zones marchables (SQL)
+La première étape consiste à définir une zone d'étude. Pour notre cas, j'ai choisi le centre ville de Nantes car elle s'avère d'une zone très dynamique en termes des commerces et passage des piétons. Une fois la zone d'étude est définie, on procède à extraire l'information geospatiale des fichiers pour le traitement sur SQL (Fonctions créés dans le cadre du stage de L. Jacquesson). Les fichiers ont été récuperés du site BBBike (open access) en format GeoJSON. Ces fichiers ont été traités sur SQL grace aux fonctions créés par L. Jacquesson avec lesquelles on peut génerer un buffer autour des zones marchables où il est possible de placer des piétons. Ces fonctions peuvent être aussi utilisées pour localiser des fontaines ainsi que des zones vertes où on trouve des arbres et oiseaux (En cas où on s'intéresse à un modèle d'activité des fontaines ou oiseaux).Une fois le traitement de ces couches est abouti, on récupère une couche "ZonesMarchables" dont on va s'appuyer dans la suite pour génerer notre couche des points sources. La couche "ZonesMarchables" est répresentée ci-dessous:
+
+![ZonesMarchables](C:/Uriel\Stage Inge\Rapport Stage\MEDIA\Rapport\JPG\ZonesMarchables.jpg)
+
+# Calcul de densité piétons
+Une fois on obtient une layer avec des polygones où on peut placer nos points sources (piétons), on procède à calculer la densité des piétons dans la zone d'intérêt. Cela nous permettra de obtenir une estimation du nombre de piétons repartis dans la zone d'étude (Zone marchable) ainsi que de générer une couche des points sources qui correspond au nombre de piétons présents dans cette zone. On aura alors besoin des éléments suivants:
+
+* Spatial Density Kernel
+* Layer Boutiques (GeoFabrik)
+* Layer Restaurants (GeoFabrik)
+* Layer Tramway (GeoFabrik)
+* Layer ZPB_Explode (Fonction SQL)
+
+# Spatial Density Kernel
+Pour effectuer le calcul de densité des points, il est nécessaire de calculer le __kernel de densité__ 
+
+> Un kernel de densité est une manière non-paramétrique d'estimer la fonction de densité de probabilité d'une variable aléatoire
+
+La fonction pour effectuer ce calcul peut-être localisée dans le lien suivant:
+
+[GitHub](https://github.com/r-spatial/sf/issues/1201)
+
+```{r , message=FALSE, warning=FALSE}
+st_kde <- function(points,cellsize, bandwith, extent = NULL){
+  require(MASS)
+  require(raster)
+  require(sf)
+  if(is.null(extent)){
+    extent_vec <- st_bbox(points)[c(1,3,2,4)]
+  } else{
+    extent_vec <- st_bbox(extent)[c(1,3,2,4)]
+  }
+  
+  n_y <- ceiling((extent_vec[4]-extent_vec[3])/cellsize)
+  n_x <- ceiling((extent_vec[2]-extent_vec[1])/cellsize)
+  
+  extent_vec[2] <- extent_vec[1]+(n_x*cellsize)-cellsize
+  extent_vec[4] <- extent_vec[3]+(n_y*cellsize)-cellsize
+  
+  coords <- st_coordinates(points)
+  matrix <- kde2d(coords[,1],coords[,2],h = bandwith,n = c(n_x,n_y),lims = extent_vec)
+  raster(matrix)
+}
+
+```
+
+
+# Importation des tables
+
+On importe les tables mentionnés ci-dessus à partir de lesquelles on produira notre carte de densité:
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+
+boutiques <- st_read("BOUTIQUES.shp")
+restaurants <- st_read("RESTAURANTS.shp")
+tramway <- st_read("TRAMWAY.shp")
+zonepieton <- st_read("ZPB_EXPLODE2.shp")
+extent_zone <- st_bbox(zonepieton)[c(1,3,2,4)]
+
+```
+
+# Visualization des layers
+
+_Ces layers contiennent la position de chaque boutique, restaurant et arrêt de tramway dans la zone d'étude_
+
+On peut visualizer l'information contenue par chacune de ces layers:
+
+```{r, message=FALSE, warning=FALSE}
+boutiques84 <- st_transform(boutiques,4326)
+
+leaflet(boutiques84) %>% 
+  addTiles() %>%
+  addMarkers()
+
+resto84 <- st_transform(restaurants,4326)
+
+leaflet(resto84) %>% 
+  addTiles() %>%
+  addMarkers()
+
+tramway84 <- st_transform(tramway,4326)
+
+leaflet(tramway84) %>% 
+  addTiles() %>%
+  addMarkers()
+
+```
+
+# Estimation de densité
+
+Une fois les layers son importées, on peut démarrer avec le calcul du kernel de densité, pour cela on utilise la fonction __st_kde__
+
+```{r, message=FALSE, warning=FALSE}
+#Calcul du kernel densité
+boutiques_dens <- st_kde(boutiques,20,400,extent = extent_zone)
+restaurants_dens <- st_kde(restaurants,20,400,extent = extent_zone)
+tramway_dens <- st_kde(tramway,20,400,extent = extent_zone)
+
+#On donne les attributs de projection aux raster de densité crées
+projection(boutiques_dens) <- projection(boutiques)
+projection(tramway_dens) <- projection(tramway)
+projection(restaurants_dens) <-  projection(restaurants)
+
+```
+
+# Modèle de densité des piétons
+
+On utilise un modèle de densité avec les coefficients suivants ajustés pour la ville de Montréal, Canada:
+
+```{r, message=FALSE, warning=FALSE}
+
+#Coefficients du modèle
+coeff_boutiques <-5593
+coeff_resto <-3042
+coeff_tram <- 36922
+
+```
+
+A partir de ces coefficients, on démarre le calcul pour obtenir une layer avec le nombre de piétons par cellule
+
+```{r, message=FALSE, warning=FALSE}
+
+# on aligne les raster si jamais leur origine sont différentes
+template<- projectRaster(to = restaurants_dens, from= boutiques_dens, alignOnly=TRUE)
+
+#template is an empty raster that has the projected extent of r2 but is aligned with r1 (i.e. same resolution, origin, and crs of r1)
+resto_aligned<- projectRaster(from = restaurants_dens, to= template)
+tram_aligned <-  projectRaster(from=tramway_dens, to=template)
+
+# mosaic fait la somme des rasters
+merged_rasters<- mosaic(coeff_boutiques*boutiques_dens,coeff_resto*resto_aligned, coeff_tram*tram_aligned, fun=sum, na.rm=TRUE)
+
+# vectorisation du raster mergé
+mailles_densiy_vec_sf <-  rasterToPolygons(merged_rasters, dissolve = F)
+mailles_densiy_vec_sf <- st_as_sf(mailles_densiy_vec_sf)
+mailles_densiy_vec_sf <- st_transform(mailles_densiy_vec_sf, 2154)
+                                      
+# cellules dans zone marchable
+ZonesMarchables <- st_intersection(zonepieton, mailles_densiy_vec_sf)
+
+```
+
+# Filtrage des cellules
+
+On peut observer que dans __ZonesMarchables__ il y a des cellules trop fines et trop petites où, pour le moment, on ne veut pas placer des points sources. Alors on va filtrer ces cellules en définissant un seuil de __compacité__
+
+
+> La compacité est le rapport entre l'air et le perimétre de notre cellule
+
+On peut utiliser la librarie _lwgeom_ pour le calcul du perimétre
+
+```{r, message=FALSE, warning=FALSE}
+
+# On définit un objet en unités "metres carrés"  avec une valeur , ici 1 
+
+area_threshold <-  as_units(1,"m^2")
+
+ # On applique ce seuil avec un filtre 
+ZonesMarchables <- ZonesMarchables %>%  filter(st_area(.) > area_threshold) 
+
+# Calcul de la compacité (non normalisée)
+ZonesMarchables$compacity <-  st_area(ZonesMarchables)/st_perimeter(ZonesMarchables)
+
+# Seuil
+compacity_threshold <-  as_units(0.2, "m")
+
+# Affichage pour voir l'aspect des cellules 
+une_zone_fine <- ZonesMarchables %>%  filter(compacity < compacity_threshold) 
+plot(une_zone_fine[, "compacity"])
+
+# Filtrage des cellules au dessus du seuil de compacité
+ZonesMarchables <-  ZonesMarchables %>%  filter(compacity > compacity_threshold)
+
+```
+
+Ensuite on procéde à affecter les cellules filtrées avec le nombre de piétons correspondant
+
+```{r, message=FALSE, warning=FALSE}
+
+# affectation du nombre de piétons par cellules
+MAX_PIETONS <- 10
+ZonesMarchables$nb_pietons <-  (ZonesMarchables$layer - min(ZonesMarchables$layer)) / (max(ZonesMarchables$layer)- min(ZonesMarchables$layer))
+ZonesMarchables$nb_pietons <- ZonesMarchables$nb_pietons * MAX_PIETONS
+ZonesMarchables$nb_pietons <- round(ZonesMarchables$nb_pietons)
+plot(ZonesMarchables["nb_pietons"])
+
+``` 
+
+# Echantillonage spatial des points
+
+La prochaine étape une fois qu'on a généré une layer avec l'information sur le nombre de piétons __ZonesMarchables__ c'est d'échantilloner spatialement les points sources dans cette layer, pour cela on a 3 alternatives:
+
+* Première façon: Boucle for (Temps de calcul très elevé)
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+
+
+cells_to_fill <- ZonesMarchables[as.numeric(st_area(ZonesMarchables))  > 1,]
+# On ne remplit pas les cellules avec une densité 0
+cells_to_fill <- cells_to_fill[cells_to_fill$nb_pietons > 0 ,]
+plot(cells_to_fill["nb_pietons"])
+sourcesPietons <-  list()
+for (i in 1:nrow(cells_to_fill)){
+  c <-cells_to_fill$geometry[i]
+  n <- cells_to_fill$nb_pietons[i]
+  cat("maille", i,": ", n, "points dans" , st_area(c), "m?\n")
+  pts <- st_sample(c,n, type="regular") %>% st_sf()
+  if(nrow(pts)>0){
+    sourcesPietons[[i]] <- pts
+  }
+}
+SourcesPietons1 <- rbindlist(sourcesPietons)
+SourcesPietons1 <- SourcesPietons1 %>% st_sf()
+#affichage simple
+plot(cells_to_fill$geometry, lwd=0.1)
+plot(SourcesPietons1, add=T, cex=0.1, col="orange")
+dev.off()
+
+``` 
+
+* Déuxième façon: Intersection entre raster de densité et point sources (Temps de calcul moderé)
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+
+SourcesPietons2 <-  st_sample(cells_to_fill$geometry, size=cells_to_fill$nb_pietons, type="regular")
+#intersection entre sources et rasters de densités
+dens_boutiques <-  extract(boutiques_dens, sourcesPietons2 %>% as_Spatial())
+dens_tramway <-  extract(tramway_dens, sourcesPietons2 %>% as_Spatial())
+dens_restaurants <- extract(restaurants_dens, sourcesPietons2 %>% as_Spatial())
+# affectation des attributs
+SourcesPietons2$dens_boutiques <-  dens_boutiques
+SourcesPietons2$dens_traway <-  dens_tramway
+SourcesPietons2$dens_restaurants <-  dens_restaurants
+
+```
+
+* Troisème façon: __Left join__
+
+> Fusion entre 2 data frames où on obtient toutes les lignes de la table à gauche et toutes les lignes correspondantes de la deuxième table
+
+```{r, message=FALSE, warning=FALSE}
+
+SourcesPietons3 <- ZonesMarchables %>% filter(nb_pietons > 0) %>% st_centroid() #Filtrage des points avec une valeur = 0
+
+```
+
+# Constitution de base de données (Couplage entre modèle d'activité et modèle d'émission)
+
+Une fois que la couche __ZonesMarchables__ est génerée avec l'échantillonage spatial de points, on s'intéresse à constituer une base de données sur laquelle on appliquera une analyse fréquentielle pour mettre en evidence les caractéristiques de la voix parlée sur différentes situations: à 2 personnes, 3 personnes, etc. L'intéret de cette étape est d'obtenir un spectrum contenant l'information fréquentielle de chaque extrait d'audio découpée en pas du temps pour produire une carte de bruit dynamique dans la dernière étape. __ZonesMarchables__ sera liée à cette base de données par le nombre de piétons, ceci nous permettra d'affecter les cellules de __ZonesMarchables__ et de génerer une couche __SourcesPietons__ avec une grille de points représentant les piétons en fonction de la densité sur chaque cellule. 
+
+Nous commençons par importer les tables à traiter. Nous avons choisi de suivre le diagramme suivant pour le traitement des bases de données, où __T1__ est la table contenant les spectrums des fichiers audio obtenue de Python, __T2__ contient l'information de la base de données et __T3__ contient les données géographiques de points sources:
+
+![Workflow](C:/Uriel\Stage Inge\Rapport Stage\MEDIA\Rapport\EtapesMod.png)
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+
+#Importation des BDD et couches à traiter
+T1 <-read.csv("Spectrums_500ms.csv", head=TRUE, sep=";")
+T2 <- read.csv("BDD_Info.csv", head = TRUE, sep=";")
+T3 <- st_read("sourcesPietons3.shp")
+
+```
+Une fois que nous obtenons __T1__ et __T4__, __T5__ peut être obtenue de la fusion entre ce 2 tables en pivotant sur _ID_g_ :
+
+> _ID_g_ est l'ID géneral des fichiers audio par pas du temps. Il depend de la durée que nous avons choisi à l'entrée du calcul sur Python
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+#Fusion T1+T4 pour sortir T5
+setnames(T4, "ID", "ID_File") #On renomme la colonne pour pivoter sur ID_g
+id <- seq(1, nrow(T4), 1)
+T4 <- cbind(id,T4) 
+
+T5 <- merge(T4,T1,by="ID_File")
+```
+
+A partir de ce point, nous pasons sur __NoiseModelling__ pour la suite. Dans l'étape suivante on lance le calcul acoustique pour T5 (__Dynamic_Map__) pour obtenir des niveaux sonores des points sources en fonction du temps (T6). Des études sur l'audibilité de la voix humaine par rapport au trafic ont été menées à partir de ces résultats. 
+
+Les résultats obtenus à la fin du calcul sur __NoiseModelling__ sont les suivants :
+
+![Environnement sonore voix](C:/Uriel\Stage Inge\Rapport Stage\MEDIA\Rapport\Lpiet\LPiet.gif)
+
+![Environnement sonore trafic](C:/Uriel\Stage Inge\Rapport Stage\MEDIA\Rapport\Ltraf\LTraf.gif)
